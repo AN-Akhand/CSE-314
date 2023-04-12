@@ -1,0 +1,534 @@
+diff --git a/.vscode/settings.json b/.vscode/settings.json
+new file mode 100644
+index 0000000..2bdae7d
+--- /dev/null
++++ b/.vscode/settings.json
+@@ -0,0 +1,6 @@
++{
++    "files.associations": {
++        "user.h": "c",
++        "pstat.h": "c"
++    }
++}
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index 39a99d7..f192e52 100644
+--- a/Makefile
++++ b/Makefile
+@@ -28,7 +28,8 @@ OBJS = \
+   $K/sysfile.o \
+   $K/kernelvec.o \
+   $K/plic.o \
+-  $K/virtio_disk.o
++  $K/virtio_disk.o \
++  $K/random.o
+ 
+ # riscv64-unknown-elf- or riscv64-linux-gnu-
+ # perhaps in /opt/riscv/bin
+@@ -132,6 +133,8 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_testprocinfo\
++	$U/_testticket\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -153,7 +156,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 3
++CPUS := 1
+ endif
+ 
+ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..423b311 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -8,6 +8,7 @@ struct spinlock;
+ struct sleeplock;
+ struct stat;
+ struct superblock;
++struct pstat;
+ 
+ // bio.c
+ void            binit(void);
+@@ -106,6 +107,8 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++int             settickets(int);
++int             getpinfo(struct pstat*);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 959b778..2a51cb2 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -5,6 +5,11 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "random.h"
++#include "pstat.h"
++
++#define SEED 1
++#define INIT_TICKET 1
+ 
+ struct cpu cpus[NCPU];
+ 
+@@ -12,6 +17,8 @@ struct proc proc[NPROC];
+ 
+ struct proc *initproc;
+ 
++struct rand_state rand_state;
++
+ int nextpid = 1;
+ struct spinlock pid_lock;
+ 
+@@ -168,6 +175,9 @@ freeproc(struct proc *p)
+   p->chan = 0;
+   p->killed = 0;
+   p->xstate = 0;
++  p->initial_tickets = 0;
++  p->current_tickets = 0;
++  p->time_slices = 0;
+   p->state = UNUSED;
+ }
+ 
+@@ -232,6 +242,7 @@ uchar initcode[] = {
+ void
+ userinit(void)
+ {
++  rand_state.a = SEED;
+   struct proc *p;
+ 
+   p = allocproc();
+@@ -241,6 +252,9 @@ userinit(void)
+   // and data into it.
+   uvmfirst(p->pagetable, initcode, sizeof(initcode));
+   p->sz = PGSIZE;
++  p->initial_tickets = INIT_TICKET;
++  p->current_tickets = INIT_TICKET;
++  p->time_slices = 0;
+ 
+   // prepare for the very first "return" from kernel to user.
+   p->trapframe->epc = 0;      // user program counter
+@@ -319,6 +333,13 @@ fork(void)
+   release(&wait_lock);
+ 
+   acquire(&np->lock);
++
++  acquire(&p->lock);
++  np->initial_tickets = p->initial_tickets;
++  np->current_tickets = p->initial_tickets;
++  np->time_slices = 0;
++  release(&p->lock);
++
+   np->state = RUNNABLE;
+   release(&np->lock);
+ 
+@@ -446,28 +467,73 @@ scheduler(void)
+ {
+   struct proc *p;
+   struct cpu *c = mycpu();
++
++  int total_tickets;
++  int runnable_count;
+   
+   c->proc = 0;
+   for(;;){
+     // Avoid deadlock by ensuring that devices can interrupt.
+     intr_on();
+ 
++    total_tickets = 0;
++    runnable_count = 0;
++    
+     for(p = proc; p < &proc[NPROC]; p++) {
+       acquire(&p->lock);
+       if(p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
++        total_tickets += p->current_tickets;
++        runnable_count++;
++      }
++      release(&p->lock);
++    }
++
++
++
++    if(total_tickets == 0 && runnable_count != 0){
++      for(p = proc; p < &proc[NPROC]; p++) {
++        acquire(&p->lock);
++        if(p->state != UNUSED) {
++          p->current_tickets = p->initial_tickets;
++        }
++        release(&p->lock);
++      }
++      continue;
++    }
++
++    int draw = getrand(&rand_state) % total_tickets;
++
++    if(draw < 0){
++      draw = -draw;
++    }
++    draw++;
++    int count = 0;
++
++    for(p = proc; p < &proc[NPROC]; p++){
++      acquire(&p->lock);
++      if(p->state == RUNNABLE){
++        count += p->current_tickets;
++        if(count >= draw){
++          // Switch to chosen process.  It is the process's job
++          // to release its lock and then reacquire it
++          // before jumping back to us.
++          //printf("%d %d %d\n", p->pid, p->time_slices, p->current_tickets);
++          p->time_slices++;
++          p->state = RUNNING;
++          c->proc = p;
++          swtch(&c->context, &p->context);
++          // Process is done running for now.
++          // It should have changed its p->state before coming back.
++          p->current_tickets--;
++          //printf("%d %d %d\n", p->pid, p->time_slices, p->current_tickets);
++          c->proc = 0;
++          release(&p->lock);
++          break;
++        }
+       }
+       release(&p->lock);
+     }
++
+   }
+ }
+ 
+@@ -681,3 +747,41 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++int settickets(int tickets){
++  if(tickets <= 0){
++    return -1;
++  }
++  else{
++    struct proc *p = myproc();
++    acquire(&p->lock);
++    p->initial_tickets = tickets;
++    p->current_tickets = tickets;
++    release(&p->lock);
++    return 0;
++  }
++}
++
++int getpinfo(struct pstat *pointer){
++  struct pstat stat;
++  struct proc *p;
++  int i = 0;
++  for(p = proc; p < &proc[NPROC]; p++){
++    acquire(&p->lock);
++    if(p->state == UNUSED){
++      stat.inuse[i] = 0;
++    }
++    else{
++      stat.inuse[i] = 1;
++      stat.pid[i] = p->pid;
++      stat.tickets_original[i] = p->initial_tickets;
++      stat.tickets_current[i] = p->current_tickets;
++      stat.time_slices[i] = p->time_slices; 
++    }
++    release(&p->lock);
++    i++;
++  }
++  either_copyout(1, (uint64)pointer, &stat, sizeof stat);
++  return 0;
++}
++
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..57021db 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -91,6 +91,9 @@ struct proc {
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
++  int initial_tickets;
++  int current_tickets;
++  int time_slices;
+ 
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+@@ -104,4 +107,5 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
+ };
+diff --git a/kernel/pstat.h b/kernel/pstat.h
+new file mode 100644
+index 0000000..9213ba9
+--- /dev/null
++++ b/kernel/pstat.h
+@@ -0,0 +1,22 @@
++#ifndef _PSTAT_H_
++
++#define _PSTAT_H_
++
++#include "param.h"
++
++struct pstat {
++
++    int pid[NPROC]; // the process ID of each process
++
++    int inuse[NPROC]; // whether this slot of the process table is being used (1 or 0)
++
++    int tickets_original[NPROC]; // the number of tickets each process originally had
++
++    int tickets_current[NPROC]; // the number of tickets each process currently has
++
++    int time_slices[NPROC]; // the number of time slices each process has been scheduled
++
++};
++
++
++#endif // _PSTAT_H_
+\ No newline at end of file
+diff --git a/kernel/random.c b/kernel/random.c
+new file mode 100644
+index 0000000..23b3ae8
+--- /dev/null
++++ b/kernel/random.c
+@@ -0,0 +1,11 @@
++#include "random.h"
++/* The state must be initialized to non-zero */
++int getrand(struct rand_state *state)
++{
++	/* Algorithm "xor" from p. 4 of Marsaglia, "Xorshift RNGs" */
++	int x = state->a;
++	x ^= x << 13;
++	x ^= x >> 17;
++	x ^= x << 5;
++	return state->a = x;
++}
+\ No newline at end of file
+diff --git a/kernel/random.h b/kernel/random.h
+new file mode 100644
+index 0000000..6090197
+--- /dev/null
++++ b/kernel/random.h
+@@ -0,0 +1,13 @@
++#ifndef _RANDOM_H_
++
++#define _RANDOM_H_
++
++#include "param.h"
++
++struct rand_state {
++    int a;
++};
++
++int getrand(struct rand_state *state);
++
++#endif // _RANDOM_H_
+\ No newline at end of file
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..cbfdb87 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_settickets(void);
++extern uint64 sys_getpinfo(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +128,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_settickets]   sys_settickets,
++[SYS_getpinfo]   sys_getpinfo,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..eb29d2e 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -1,22 +1,24 @@
+ // System call numbers
+-#define SYS_fork    1
+-#define SYS_exit    2
+-#define SYS_wait    3
+-#define SYS_pipe    4
+-#define SYS_read    5
+-#define SYS_kill    6
+-#define SYS_exec    7
+-#define SYS_fstat   8
+-#define SYS_chdir   9
+-#define SYS_dup    10
+-#define SYS_getpid 11
+-#define SYS_sbrk   12
+-#define SYS_sleep  13
+-#define SYS_uptime 14
+-#define SYS_open   15
+-#define SYS_write  16
+-#define SYS_mknod  17
+-#define SYS_unlink 18
+-#define SYS_link   19
+-#define SYS_mkdir  20
+-#define SYS_close  21
++#define SYS_fork        1
++#define SYS_exit        2
++#define SYS_wait        3
++#define SYS_pipe        4
++#define SYS_read        5
++#define SYS_kill        6
++#define SYS_exec        7
++#define SYS_fstat       8
++#define SYS_chdir       9
++#define SYS_dup        10
++#define SYS_getpid     11
++#define SYS_sbrk       12
++#define SYS_sleep      13
++#define SYS_uptime     14
++#define SYS_open       15
++#define SYS_write      16
++#define SYS_mknod      17
++#define SYS_unlink     18
++#define SYS_link       19
++#define SYS_mkdir      20
++#define SYS_close      21
++#define SYS_settickets 22
++#define SYS_getpinfo   23
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 1de184e..0268a30 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -89,3 +89,19 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_settickets(void)
++{
++  int tickets;
++  argint(0, &tickets);
++  return settickets(tickets);
++}
++
++uint64
++sys_getpinfo(void)
++{
++  uint64 pointer;
++  argaddr(0, &pointer);
++  return getpinfo((struct pstat*)pointer);
++}
+diff --git a/user/testprocinfo.c b/user/testprocinfo.c
+new file mode 100644
+index 0000000..5e3c8e3
+--- /dev/null
++++ b/user/testprocinfo.c
+@@ -0,0 +1,18 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/pstat.h"
++#include "user/user.h"
++
++int main(int argc, char *argv[]){
++    settickets(10);
++    struct pstat stat;
++    getpinfo(&stat);
++    printf("PID | In Use | Original Tickets | Current Tickets | Time Slices\n");
++    for(int i = 0; i < NPROC; i++){
++        if(stat.inuse[i] != 0){
++            printf("%d\t%d\t\t%d\t\t%d\t\t%d\n", stat.pid[i], stat.inuse[i], stat.tickets_original[i], stat.tickets_current[i], stat.time_slices[i]);
++        }
++    }
++    return 0;
++}
+\ No newline at end of file
+diff --git a/user/testticket.c b/user/testticket.c
+new file mode 100644
+index 0000000..9b782d6
+--- /dev/null
++++ b/user/testticket.c
+@@ -0,0 +1,30 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/pstat.h"
++#include "user/user.h"
++
++int main(int argc, char *argv[]){
++
++    int ticket;
++
++    if(argc == 1){
++        ticket = 10;
++    }
++    else if(argc > 1 && (argv[1][0] < '0' || argv[1][0] > '9')){
++        fprintf(2, "Usage: %s ticket_no\n", argv[0]);
++        exit(1);
++    }
++    else{
++        ticket = atoi(argv[1]);
++    }
++    settickets(ticket);
++    if(fork() == 0){
++        settickets(ticket);
++    }
++    else{
++        settickets(ticket * 2);
++    }
++    while(1);
++    return 0;
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..64b8048 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,4 +1,5 @@
+ struct stat;
++struct pstat;
+ 
+ // system calls
+ int fork(void);
+@@ -22,6 +23,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int settickets(int);
++int getpinfo(struct pstat*);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..d2435c1 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("settickets");
++entry("getpinfo");

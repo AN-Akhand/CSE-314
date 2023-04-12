@@ -1,0 +1,499 @@
+diff --git a/.vscode/settings.json b/.vscode/settings.json
+new file mode 100644
+index 0000000..d00743e
+--- /dev/null
++++ b/.vscode/settings.json
+@@ -0,0 +1,10 @@
++{
++    "files.associations": {
++        "defs.h": "c",
++        "*.tcc": "c",
++        "fstream": "c",
++        "ostream": "c",
++        "user.h": "c",
++        "memlayout.h": "c"
++    }
++}
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index 39a99d7..5d008a7 100644
+--- a/Makefile
++++ b/Makefile
+@@ -132,6 +132,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_testcow\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..d109fcb 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -63,6 +63,11 @@ void            ramdiskrw(struct buf*);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++void            incRefCount(void *);
++void            decRefCount(void *);
++int             getRefCount(void *);
++void            setRefCount(void *, int);
++int             free_memory(void);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+@@ -173,6 +178,7 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++int             writeFaultHandler(pagetable_t, uint64);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 0699e7e..a0e2b10 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -14,6 +14,13 @@ void freerange(void *pa_start, void *pa_end);
+ extern char end[]; // first address after kernel.
+                    // defined by kernel.ld.
+ 
++
++struct refCount {
++  struct spinlock lock;
++  int count;
++} refCount[(PHYSTOP - KERNBASE)/PGSIZE];
++
++
+ struct run {
+   struct run *next;
+ };
+@@ -28,6 +35,10 @@ kinit()
+ {
+   initlock(&kmem.lock, "kmem");
+   freerange(end, (void*)PHYSTOP);
++  for(int i = 0; i < (PHYSTOP - KERNBASE)/PGSIZE; i++){
++    initlock(&refCount[i].lock, "refCount");
++    refCount[i].count = 0;
++  }
+ }
+ 
+ void
+@@ -45,6 +56,12 @@ freerange(void *pa_start, void *pa_end)
+ // initializing the allocator; see kinit above.)
+ void
+ kfree(void *pa)
++{
++  decRefCount(pa);
++}
++
++void
++kfreeOrig(void *pa)
+ {
+   struct run *r;
+ 
+@@ -77,6 +94,59 @@ kalloc(void)
+   release(&kmem.lock);
+ 
+   if(r)
++  {
+     memset((char*)r, 5, PGSIZE); // fill with junk
++    setRefCount(r, 1);
++  }
+   return (void*)r;
+ }
++
++// increase the reference count of a page
++void incRefCount(void *pa){
++  int index = ((uint64)pa - KERNBASE)/PGSIZE;
++  acquire(&refCount[index].lock);
++  refCount[index].count++;
++  release(&refCount[index].lock);
++}
++
++// decrease the reference count of a page
++void decRefCount(void *pa){
++  int index = ((uint64)pa - KERNBASE)/PGSIZE;
++  acquire(&refCount[index].lock);
++  if(refCount[index].count > 0){
++    refCount[index].count--;
++  }
++  if(refCount[index].count == 0){
++    kfreeOrig(pa);
++  }
++  release(&refCount[index].lock);
++}
++
++// get the reference count of a page
++int getRefCount(void *pa){
++  int index = ((uint64)pa - KERNBASE)/PGSIZE;
++  int count = refCount[index].count;
++  return count;
++}
++
++// set the reference count of a page
++void setRefCount(void *pa, int count){
++  int index = ((uint64)pa - KERNBASE)/PGSIZE;
++  acquire(&refCount[index].lock);
++  refCount[index].count = count;
++  release(&refCount[index].lock);
++}
++
++int 
++free_memory(){
++  struct run *r;
++  int n = 0;
++  acquire(&kmem.lock);
++  r = kmem.freelist;
++  while(r){
++    n++;
++    r = r->next;
++  }
++  release(&kmem.lock);
++  return n * 4096;
++}
+\ No newline at end of file
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 20a01db..25c2c2b 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -343,6 +343,7 @@ typedef uint64 *pagetable_t; // 512 PTEs
+ #define PTE_W (1L << 2)
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // user can access
++#define PTE_COW (1L << 9) // copy-on-write
+ 
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+@@ -351,6 +352,18 @@ typedef uint64 *pagetable_t; // 512 PTEs
+ 
+ #define PTE_FLAGS(pte) ((pte) & 0x3FF)
+ 
++// clear write bit of pte
++#define PTE_CLEAR_WRITE(pte) ((pte) & ~PTE_W)
++
++// set write bit of pte
++#define PTE_SET_WRITE(pte) ((pte) | PTE_W)
++
++// mark copy on write
++#define PTE_SET_COW(pte) ((pte) | PTE_COW)
++
++// clear copy on write
++#define PTE_CLEAR_COW(pte) ((pte) & ~PTE_COW)
++
+ // extract the three 9-bit page table indices from a virtual address.
+ #define PXMASK          0x1FF // 9 bits
+ #define PXSHIFT(level)  (PGSHIFT+(9*(level)))
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..0d9bb45 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_meminfo(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +127,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_meminfo] sys_meminfo,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..3ac3a4b 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_meminfo 22
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 1de184e..0c0a56a 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -89,3 +89,10 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_meminfo(void) 
++{
++  printf("free-memory: %d\n", free_memory());
++	return 0;
++} 
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 512c850..696f7c1 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -67,6 +67,13 @@ usertrap(void)
+     syscall();
+   } else if((which_dev = devintr()) != 0){
+     // ok
++  } else if(r_scause() == 15){
++    uint64 va = PGROUNDDOWN(r_stval());
++    //printf("page fault pid : %d va : %d\n", p->pid, va);
++    if(writeFaultHandler(p->pagetable, va)){
++      printf("page fault %d\n", p->pid);
++      setkilled(p);
++    }
+   } else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 9f69783..9a39d05 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -304,6 +304,37 @@ uvmfree(pagetable_t pagetable, uint64 sz)
+ // frees any allocated pages on failure.
+ int
+ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
++{
++  pte_t *pte;
++  uint64 pa, i;
++  uint flags;
++
++  for(i = 0; i < sz; i += PGSIZE){
++    if((pte = walk(old, i, 0)) == 0)
++      panic("uvmcopy: pte should exist");
++    if((*pte & PTE_V) == 0)
++      panic("uvmcopy: page not present");
++
++    if(*pte & PTE_W){
++      *pte = PTE_SET_COW(*pte);
++      *pte = PTE_CLEAR_WRITE(*pte);
++    }
++    pa = PTE2PA(*pte);
++    flags = PTE_FLAGS(*pte);
++    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
++      goto err;
++    }
++    incRefCount((void *)pa);
++  }
++  return 0;
++
++ err:
++  uvmunmap(new, 0, i / PGSIZE, 1);
++  return -1;
++}
++
++int
++uvmcopyOrig(pagetable_t old, pagetable_t new, uint64 sz)
+ {
+   pte_t *pte;
+   uint64 pa, i;
+@@ -353,6 +384,41 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ {
+   uint64 n, va0, pa0;
+ 
++  while(len > 0){
++    va0 = PGROUNDDOWN(dstva);
++    if(va0 >= MAXVA) {
++      return -1;
++    }
++
++    pte_t *pte;
++    pte = walk(pagetable, va0, 0);
++
++    if ((pte == 0) || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0) {
++      return -1;
++    }
++    if (*pte & PTE_COW){
++      writeFaultHandler(pagetable, va0);
++    }
++    pa0 = PTE2PA(*pte);
++    if(pa0 == 0)
++      return -1;
++    n = PGSIZE - (dstva - va0);
++    if(n > len)
++      n = len;
++    memmove((void *)(pa0 + (dstva - va0)), src, n);
++
++    len -= n;
++    src += n;
++    dstva = va0 + PGSIZE;  
++  }
++  return 0;
++}
++
++int
++copyoutOrig(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
++{
++  uint64 n, va0, pa0;
++
+   while(len > 0){
+     va0 = PGROUNDDOWN(dstva);
+     pa0 = walkaddr(pagetable, va0);
+@@ -437,3 +503,35 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
++
++int writeFaultHandler(pagetable_t pagetable, uint64 va){
++  if(va >= MAXVA)
++    return -1;
++  pte_t *pte = walk(pagetable, va, 0);
++  if(pte == 0)
++    return -1;
++  if((*pte & PTE_V) && (*pte & PTE_U) && (*pte & PTE_COW)){
++    uint64 pa = PTE2PA(*pte);
++    //printf("pa = %p refCount = %d \n", pa, getRefCount((void *)pa));
++    if(getRefCount((void *)pa) == 1){
++      *pte = PTE_SET_WRITE(*pte);
++      *pte = PTE_CLEAR_COW(*pte);
++      return 0;
++    }
++    uint64 flags = PTE_FLAGS(*pte);
++    flags = PTE_SET_WRITE(flags);
++    flags = PTE_CLEAR_COW(flags);
++    char *mem;
++    if((mem = kalloc()) == 0){
++      return -1;
++    } else {
++      memmove(mem, (char*)PTE2PA(*pte), PGSIZE);
++      uvmunmap(pagetable, va, 1, 1);
++      mappages(pagetable, va, PGSIZE, (uint64)mem, flags);
++      return 0;
++    }
++  }
++  else {
++    return -1;
++  }
++}
+diff --git a/user/testcow.c b/user/testcow.c
+new file mode 100644
+index 0000000..b81935f
+--- /dev/null
++++ b/user/testcow.c
+@@ -0,0 +1,101 @@
++#include "kernel/types.h"
++#include "kernel/riscv.h"
++#include "user/user.h"
++#include "kernel/memlayout.h"
++
++
++int fds[2];
++char buf[4096];
++
++void
++testcopyout()
++{
++  
++  buf[0] = 99;
++
++  for(int i = 0; i < 4; i++){
++    if(pipe(fds) != 0){
++      printf("pipe() failed\n");
++      exit(-1);
++    }
++    int pid = fork();
++    if(pid == 0){
++      sleep(1);
++      if(read(fds[0], buf, sizeof(i)) != sizeof(i)){
++        printf("error: read failed\n");
++        exit(1);
++      }
++      sleep(1);
++      int j = *(int*)buf;
++      if(j != i){
++        printf("error: read the wrong value\n");
++        exit(1);
++      }
++      exit(0);
++    }
++    if(write(fds[1], &i, sizeof(i)) != sizeof(i)){
++      printf("error: write failed\n");
++      exit(-1);
++    }
++  }
++
++  int xstatus = 0;
++  for(int i = 0; i < 4; i++) {
++    wait(&xstatus);
++    if(xstatus != 0) {
++      exit(1);
++    }
++  }
++
++  if(buf[0] != 99){
++    printf("error: child overwrote parent\n");
++    exit(1);
++  }
++
++  printf("ok\n");
++}
++
++
++int
++main(int argc, char *argv[]){
++  printf("Start\n");
++  meminfo();
++  uint64 a = (uint64)sbrk(PGSIZE * 10);
++  int *b = (int *) a;
++  printf("After sbrk\n");
++  meminfo();
++  int pid = fork();
++  if(pid == 0){
++    printf("Child\n");
++    meminfo();
++    printf("%d\n", *b);
++    printf("After read\n");
++    meminfo();
++    *b = 1;
++    printf("%d\n", *b);
++    printf("After write\n");
++    meminfo();
++    a += PGSIZE * 2;
++    b = (int *) a;
++    printf("%d\n", *b);
++    printf("After another read\n");
++    meminfo();
++    *b = 2;
++    printf("%d\n", *b);
++    printf("After another write\n");
++    meminfo();
++    exit(0);
++  }
++  else{
++    wait(0);
++    printf("%d\n", *b);
++    printf("After parent read, not same as child\n");
++    meminfo();
++    *b = 3;
++    printf("%d\n", *b);
++    printf("After parent write, should not decrease\n");
++    meminfo();
++  }
++  testcopyout();
++  return 0;
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..a1e53e3 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,7 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int meminfo(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..252db8c 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("meminfo");
+\ No newline at end of file

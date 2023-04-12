@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "defs.h": "c",
+        "*.tcc": "c",
+        "fstream": "c",
+        "ostream": "c",
+        "user.h": "c",
+        "memlayout.h": "c"
+    }
+}

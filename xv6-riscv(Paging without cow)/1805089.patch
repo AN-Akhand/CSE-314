@@ -1,0 +1,1190 @@
+diff --git a/.vscode/settings.json b/.vscode/settings.json
+new file mode 100644
+index 0000000..55bc865
+--- /dev/null
++++ b/.vscode/settings.json
+@@ -0,0 +1,6 @@
++{
++    "files.associations": {
++        "defs.h": "c",
++        "param.h": "c"
++    }
++}
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index 39a99d7..03081ec 100644
+--- a/Makefile
++++ b/Makefile
+@@ -24,11 +24,13 @@ OBJS = \
+   $K/sleeplock.o \
+   $K/file.o \
+   $K/pipe.o \
++  $K/swap.o \
+   $K/exec.o \
+   $K/sysfile.o \
+   $K/kernelvec.o \
+   $K/plic.o \
+-  $K/virtio_disk.o
++  $K/virtio_disk.o \
++  $K/livepage.o \
+ 
+ # riscv64-unknown-elf- or riscv64-linux-gnu-
+ # perhaps in /opt/riscv/bin
+@@ -132,6 +134,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_sysinfotest\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..770f232 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -8,6 +8,7 @@ struct spinlock;
+ struct sleeplock;
+ struct stat;
+ struct superblock;
++struct swap;
+ 
+ // bio.c
+ void            binit(void);
+@@ -36,6 +37,8 @@ int             filewrite(struct file*, uint64, int n);
+ 
+ // fs.c
+ void            fsinit(int);
++uint            balloc(uint dev);
++void            bfree(int dev, uint b);
+ int             dirlink(struct inode*, char*, uint);
+ struct inode*   dirlookup(struct inode*, char*, uint*);
+ struct inode*   ialloc(uint, short);
+@@ -63,6 +66,7 @@ void            ramdiskrw(struct buf*);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++int             free_memory(void);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+@@ -88,7 +92,7 @@ int             fork(void);
+ int             growproc(int);
+ void            proc_mapstacks(pagetable_t);
+ pagetable_t     proc_pagetable(struct proc *);
+-void            proc_freepagetable(pagetable_t, uint64);
++void            proc_freepagetable(pagetable_t, uint64, int);
+ int             kill(int);
+ int             killed(struct proc*);
+ void            setkilled(struct proc*);
+@@ -106,6 +110,20 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++pagetable_t     getpagetable(int pid);
++
++
++// swap.c
++void            swapinit(void);
++void            swapfree(struct swap*);
++struct swap*    swapalloc(void);
++void            swapout(struct swap *dst_sp, char *src_pa);
++void            swapin(char *dst_pa, struct swap *src_sp);
++
++// livepage.c
++int             getsize(void);
++void            printlivepagequeue(void);
++void            enqueue(int, uint64);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+@@ -162,17 +180,18 @@ void            kvmmap(pagetable_t, uint64, uint64, uint64, int);
+ int             mappages(pagetable_t, uint64, uint64, uint64, int);
+ pagetable_t     uvmcreate(void);
+ void            uvmfirst(pagetable_t, uchar *, uint);
+-uint64          uvmalloc(pagetable_t, uint64, uint64, int);
+-uint64          uvmdealloc(pagetable_t, uint64, uint64);
+-int             uvmcopy(pagetable_t, pagetable_t, uint64);
+-void            uvmfree(pagetable_t, uint64);
+-void            uvmunmap(pagetable_t, uint64, uint64, int);
++uint64          uvmalloc(pagetable_t, uint64, uint64, int, int);
++uint64          uvmdealloc(pagetable_t, uint64, uint64, int);
++int             uvmcopy(pagetable_t, pagetable_t, uint64, uint64, int, int);
++void            uvmfree(pagetable_t, uint64, int);
++void            uvmunmap(pagetable_t, uint64, uint64, int, int);
+ void            uvmclear(pagetable_t, uint64);
+ pte_t *         walk(pagetable_t, uint64, int);
+ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++int             handleswapin(uint64);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/exec.c b/kernel/exec.c
+index e18bbb6..cd51a67 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -62,7 +62,7 @@ exec(char *path, char **argv)
+     if(ph.vaddr % PGSIZE != 0)
+       goto bad;
+     uint64 sz1;
+-    if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz, flags2perm(ph.flags))) == 0)
++    if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz, flags2perm(ph.flags), 0)) == 0)
+       goto bad;
+     sz = sz1;
+     if(loadseg(pagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
+@@ -80,7 +80,7 @@ exec(char *path, char **argv)
+   // Use the second as the user stack.
+   sz = PGROUNDUP(sz);
+   uint64 sz1;
+-  if((sz1 = uvmalloc(pagetable, sz, sz + 2*PGSIZE, PTE_W)) == 0)
++  if((sz1 = uvmalloc(pagetable, sz, sz + 2*PGSIZE, PTE_W, 0)) == 0)
+     goto bad;
+   sz = sz1;
+   uvmclear(pagetable, sz-2*PGSIZE);
+@@ -124,15 +124,16 @@ exec(char *path, char **argv)
+   oldpagetable = p->pagetable;
+   p->pagetable = pagetable;
+   p->sz = sz;
++  p->orig_sz = sz;
+   p->trapframe->epc = elf.entry;  // initial program counter = main
+   p->trapframe->sp = sp; // initial stack pointer
+-  proc_freepagetable(oldpagetable, oldsz);
++  proc_freepagetable(oldpagetable, oldsz, p->pid);
+ 
+   return argc; // this ends up in a0, the first argument to main(argc, argv)
+ 
+  bad:
+   if(pagetable)
+-    proc_freepagetable(pagetable, sz);
++    proc_freepagetable(pagetable, sz, p->pid);
+   if(ip){
+     iunlockput(ip);
+     end_op();
+diff --git a/kernel/fs.c b/kernel/fs.c
+index c6bab15..2d9b419 100644
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -62,7 +62,7 @@ bzero(int dev, int bno)
+ 
+ // Allocate a zeroed disk block.
+ // returns 0 if out of disk space.
+-static uint
++uint
+ balloc(uint dev)
+ {
+   int b, bi, m;
+@@ -88,7 +88,7 @@ balloc(uint dev)
+ }
+ 
+ // Free a disk block.
+-static void
++void
+ bfree(int dev, uint b)
+ {
+   struct buf *bp;
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 0699e7e..9758178 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -80,3 +80,17 @@ kalloc(void)
+     memset((char*)r, 5, PGSIZE); // fill with junk
+   return (void*)r;
+ }
++
++int 
++free_memory(){
++  struct run *r;
++  int n = 0;
++  acquire(&kmem.lock);
++  r = kmem.freelist;
++  while(r){
++    n++;
++    r = r->next;
++  }
++  release(&kmem.lock);
++  return n * 4096;
++}
+diff --git a/kernel/livepage.c b/kernel/livepage.c
+new file mode 100644
+index 0000000..217bc34
+--- /dev/null
++++ b/kernel/livepage.c
+@@ -0,0 +1,205 @@
++#include "types.h"
++#include "riscv.h"
++#include "fs.h"
++#include "spinlock.h"
++#include "defs.h"
++#include "param.h"
++#include "sleeplock.h"
++#include "buf.h"
++#include "livepage.h"
++
++struct run {
++  struct run *next;
++};
++
++struct {
++  struct spinlock lock;
++  struct run *freelist;
++} livepagemem;
++
++struct livepagequeue {
++  struct spinlock lock;
++  struct livepage *head;
++  struct livepage *tail;
++  int size;
++} queue;
++
++// Initialize livepagemem
++void
++livepageinit(void)
++{
++  initlock(&livepagemem.lock, "livepagemem");
++  livepagemem.freelist = 0;
++}
++
++// Allocate one livepage struct.
++// Returns a pointer to the livepage struct.
++// Returns 0 if the memory cannot be allocated.
++struct livepage *
++livepagealloc(void)
++{
++  struct run *r;
++  struct livepage *s;
++
++  acquire(&livepagemem.lock);
++  r = livepagemem.freelist;
++  if(!r){
++    release(&livepagemem.lock);
++    char *mem = kalloc();
++    char *mem_end = mem + PGSIZE;
++    for(; mem + sizeof(struct livepage) <= mem_end; mem += sizeof(struct livepage)){
++      r = (struct run*)mem;
++
++      acquire(&livepagemem.lock);
++      r->next = livepagemem.freelist;
++      livepagemem.freelist = r;
++      release(&livepagemem.lock);
++    }
++    acquire(&livepagemem.lock);
++    r = livepagemem.freelist;
++  }
++  livepagemem.freelist = r->next;
++  release(&livepagemem.lock);
++  
++  s = (struct livepage*)r;
++  
++  return s;
++}
++
++// Free the livepage struct pointed to by s.
++void
++livepagefree(struct livepage *s)
++{
++  struct run *r;
++
++  if(!s)
++    panic("livepagefree");
++
++  r = (struct run*)s;
++
++  acquire(&livepagemem.lock);
++  r->next = livepagemem.freelist;
++  livepagemem.freelist = r;
++  release(&livepagemem.lock);
++}
++
++
++void initlivepagequeue(struct livepagequeue queue) {
++  livepageinit();
++  initlock(&queue.lock, "livepagequeue");
++  queue.head = 0;
++  queue.tail = 0;
++  queue.size = 0;
++}
++
++void enqueue(int pid, uint64 va){
++  acquire(&queue.lock);
++  struct livepage *p = livepagealloc();
++  p->pid = pid;
++  p->va = va;
++  p->nextpage = 0;
++  if (queue.tail == 0) {
++    queue.head = p;
++    queue.tail = p;
++  } else {
++    queue.tail->nextpage = p;
++    queue.tail = p;
++  }
++  queue.size++;
++  release(&queue.lock);
++}
++
++void dequeue(){
++  acquire(&queue.lock);
++  if (queue.head == 0) {
++    release(&queue.lock);
++    return;
++  }
++  struct livepage *p = queue.head;
++  queue.head = p->nextpage;
++  if (queue.head == 0) {
++    queue.tail = 0;
++  }
++  livepagefree(p);
++  queue.size--;
++  release(&queue.lock);
++}
++
++void remove(int pid, uint64 va){
++  acquire(&queue.lock);
++  struct livepage *p = queue.head;
++  struct livepage *prev = 0;
++  while (p != 0) {
++    if (p->pid == pid && p->va == va) {
++      if (prev == 0) {
++        queue.head = p->nextpage;
++      } else {
++        prev->nextpage = p->nextpage;
++      }
++      if (p->nextpage == 0) {
++        queue.tail = prev;
++      }
++      livepagefree(p);
++      queue.size--;
++      release(&queue.lock);
++      return;
++    }
++    prev = p;
++    p = p->nextpage;
++  }
++  release(&queue.lock);
++}
++
++int getsize(){
++  return queue.size;
++}
++
++struct livepage* gethead(){
++  acquire(&queue.lock);
++  struct livepage *p = queue.head;
++  release(&queue.lock);
++  return p;
++}
++
++struct livepage* gettail(){
++  acquire(&queue.lock);
++  struct livepage *p = queue.tail;
++  release(&queue.lock);
++  return p;
++}
++
++void printlivepagequeue(){
++  acquire(&queue.lock);
++  struct livepage *p = queue.head;
++  while (p != 0) {
++    printf("pid: %d, va: %p\n", p->pid, p->va);
++    p = p->nextpage;
++  }
++  release(&queue.lock);
++}
++
++void removeprocess(int pid) {
++  acquire(&queue.lock);
++  struct livepage *p = queue.head;
++  struct livepage *prev = 0;
++  while (p != 0) {
++    if (p->pid == pid) {
++      if (prev == 0) {
++        queue.head = p->nextpage;
++      } else {
++        prev->nextpage = p->nextpage;
++      }
++      if (p->nextpage == 0) {
++        queue.tail = prev;
++      }
++      livepagefree(p);
++      queue.size--;
++      p = prev;
++    }
++    prev = p;
++    if (p != 0) {
++      p = p->nextpage;
++    }
++  }
++  release(&queue.lock);
++}
+diff --git a/kernel/livepage.h b/kernel/livepage.h
+new file mode 100644
+index 0000000..e676dee
+--- /dev/null
++++ b/kernel/livepage.h
+@@ -0,0 +1,41 @@
++struct livepage {
++  uint64 va;
++  int pid;
++  struct livepage *nextpage;
++};
++
++struct livepage *
++livepagealloc(void);
++
++void
++livepageinit(void);
++
++void
++livepagefree(struct livepage*);
++
++void 
++initlivepagequeue();
++
++void 
++enqueue(int pid, uint64 va);
++
++void 
++dequeue();
++
++void 
++remove(int pid, uint64 va);
++
++int
++getsize();
++
++struct livepage* 
++gethead();
++
++struct livepage* 
++gettail();
++
++void 
++printlivepagequeue();
++
++void 
++removeprocess(int);
+\ No newline at end of file
+diff --git a/kernel/param.h b/kernel/param.h
+index 6624bff..a7180c7 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -11,3 +11,4 @@
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+ #define FSSIZE       2000  // size of file system in blocks
+ #define MAXPATH      128   // maximum file path name
++#define MAXPHYPAGES  50    // maximum number of physical pages 
+\ No newline at end of file
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 959b778..54c3c04 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -158,8 +158,10 @@ freeproc(struct proc *p)
+   if(p->trapframe)
+     kfree((void*)p->trapframe);
+   p->trapframe = 0;
++  //release(&p->lock);
+   if(p->pagetable)
+-    proc_freepagetable(p->pagetable, p->sz);
++    proc_freepagetable(p->pagetable, p->sz, p->pid);
++  //acquire(&p->lock);
+   p->pagetable = 0;
+   p->sz = 0;
+   p->pid = 0;
+@@ -189,7 +191,7 @@ proc_pagetable(struct proc *p)
+   // to/from user space, so not PTE_U.
+   if(mappages(pagetable, TRAMPOLINE, PGSIZE,
+               (uint64)trampoline, PTE_R | PTE_X) < 0){
+-    uvmfree(pagetable, 0);
++    uvmfree(pagetable, 0, p->pid);
+     return 0;
+   }
+ 
+@@ -197,8 +199,8 @@ proc_pagetable(struct proc *p)
+   // trampoline.S.
+   if(mappages(pagetable, TRAPFRAME, PGSIZE,
+               (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
+-    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+-    uvmfree(pagetable, 0);
++    uvmunmap(pagetable, TRAMPOLINE, 1, 0, p->pid);
++    uvmfree(pagetable, 0, p->pid);
+     return 0;
+   }
+ 
+@@ -208,11 +210,11 @@ proc_pagetable(struct proc *p)
+ // Free a process's page table, and free the
+ // physical memory it refers to.
+ void
+-proc_freepagetable(pagetable_t pagetable, uint64 sz)
++proc_freepagetable(pagetable_t pagetable, uint64 sz, int pid)
+ {
+-  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+-  uvmunmap(pagetable, TRAPFRAME, 1, 0);
+-  uvmfree(pagetable, sz);
++  uvmunmap(pagetable, TRAMPOLINE, 1, 0, pid);
++  uvmunmap(pagetable, TRAPFRAME, 1, 0, pid);
++  uvmfree(pagetable, sz, pid);
+ }
+ 
+ // a user program that calls exec("/init")
+@@ -264,11 +266,11 @@ growproc(int n)
+ 
+   sz = p->sz;
+   if(n > 0){
+-    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
++    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W, myproc()->pid)) == 0) {
+       return -1;
+     }
+   } else if(n < 0){
+-    sz = uvmdealloc(p->pagetable, sz, sz + n);
++    sz = uvmdealloc(p->pagetable, sz, sz + n, myproc()->pid);
+   }
+   p->sz = sz;
+   return 0;
+@@ -288,13 +290,15 @@ fork(void)
+     return -1;
+   }
+ 
++  release(&np->lock);
+   // Copy user memory from parent to child.
+-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
++  if(uvmcopy(p->pagetable, np->pagetable, p->sz, p->orig_sz, np->pid, p->pid) < 0){
+     freeproc(np);
+-    release(&np->lock);
+     return -1;
+   }
++  acquire(&np->lock);
+   np->sz = p->sz;
++  np->orig_sz = p->orig_sz;
+ 
+   // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+@@ -414,9 +418,9 @@ wait(uint64 addr)
+             release(&wait_lock);
+             return -1;
+           }
+-          freeproc(pp);
+           release(&pp->lock);
+           release(&wait_lock);
++          freeproc(pp);
+           return pid;
+         }
+         release(&pp->lock);
+@@ -681,3 +685,13 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++pagetable_t getpagetable(int pid){
++  struct proc *p;
++  for(p = proc; p < &proc[NPROC]; p++) {
++    if(p->pid == pid) {
++      return p->pagetable;
++    }
++  }
++  return 0;
++}
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..f85b1a2 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,5 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  uint64 orig_sz;              // Original size of process memory
+ };
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 20a01db..741ab5d 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -343,6 +343,7 @@ typedef uint64 *pagetable_t; // 512 PTEs
+ #define PTE_W (1L << 2)
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // user can access
++#define PTE_P (1L << 8) // global
+ 
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+@@ -351,6 +352,21 @@ typedef uint64 *pagetable_t; // 512 PTEs
+ 
+ #define PTE_FLAGS(pte) ((pte) & 0x3FF)
+ 
++
++// mark as swapped out.
++
++#define PTE_MARK_SWAPPED(pte) (((pte) & ~PTE_V) | PTE_P) 
++
++#define PTE_UNMARK_SWAPPED(pte) (((pte) & ~PTE_P) | PTE_V)
++
++#define PTE_IS_SWAPPED(pte) (((pte) & PTE_P) && !((pte) & PTE_V))
++
++// save swap addr
++#define SAVE_SWAPADDR(pte, addr) (((pte) & 0x3FF) | ((addr) << 10))
++
++#define PTE2SWAPADDR(pte) ((pte) >> 10)
++
++
+ // extract the three 9-bit page table indices from a virtual address.
+ #define PXMASK          0x1FF // 9 bits
+ #define PXSHIFT(level)  (PGSHIFT+(9*(level)))
+diff --git a/kernel/swap.c b/kernel/swap.c
+new file mode 100644
+index 0000000..f33bf40
+--- /dev/null
++++ b/kernel/swap.c
+@@ -0,0 +1,135 @@
++#include "types.h"
++#include "riscv.h"
++#include "fs.h"
++#include "spinlock.h"
++#include "defs.h"
++#include "param.h"
++#include "sleeplock.h"
++#include "buf.h"
++
++#define NBLOCKPERPAGE (PGSIZE / BSIZE)
++
++struct swap {
++  uint blocknos[NBLOCKPERPAGE];
++};
++
++struct run {
++  struct run *next;
++};
++
++struct {
++  struct spinlock lock;
++  struct run *freelist;
++} swapmem;
++
++// Initialize swapmem
++void
++swapinit(void)
++{
++  initlock(&swapmem.lock, "swapmem");
++  swapmem.freelist = 0;
++}
++
++// Allocate one swap struct.
++// Returns a pointer to the swap struct.
++// Returns 0 if the memory cannot be allocated.
++struct swap *
++swapalloc(void)
++{
++  struct run *r;
++  struct swap *s;
++
++  acquire(&swapmem.lock);
++  r = swapmem.freelist;
++  if(!r){
++    release(&swapmem.lock);
++    char *mem = kalloc();
++    char *mem_end = mem + PGSIZE;
++    for(; mem + sizeof(struct swap) <= mem_end; mem += sizeof(struct swap)){
++      r = (struct run*)mem;
++
++      acquire(&swapmem.lock);
++      r->next = swapmem.freelist;
++      swapmem.freelist = r;
++      release(&swapmem.lock);
++    }
++    acquire(&swapmem.lock);
++    r = swapmem.freelist;
++  }
++  swapmem.freelist = r->next;
++  release(&swapmem.lock);
++  
++  s = (struct swap*)r;
++  if(s)
++    memset((char*)s->blocknos, 0, sizeof(s->blocknos)); // fill with zeros
++  
++  return s;
++}
++
++// Free the swap struct pointed by s, and the blocks
++// contained in s, which normally should have been returned
++// by a call to swapalloc() and swapout().
++void
++swapfree(struct swap *s)
++{
++  uint *blockno;
++  struct run *r;
++
++  if(!s)
++    panic("swapfree");
++  
++  begin_op();
++  for(blockno = s->blocknos; blockno < &s->blocknos[NBLOCKPERPAGE]; blockno++){
++    if(*blockno)
++      bfree(ROOTDEV, *blockno);
++  }
++  end_op();
++
++  r = (struct run*)s;
++
++  acquire(&swapmem.lock);
++  r->next = swapmem.freelist;
++  swapmem.freelist = r;
++  release(&swapmem.lock);
++}
++
++// Swap out a given physical page src_pa to disk.
++// The metadata for retriving src_pa will be saved
++// to dst_pa which normally should have been returned
++// by a call to swapalloc().
++void
++swapout(struct swap *dst_sp, char *src_pa)
++{
++  uint *blockno;
++  struct buf *bp;
++  
++  begin_op();
++  for(blockno = dst_sp->blocknos; blockno < &dst_sp->blocknos[NBLOCKPERPAGE]; blockno++, src_pa += BSIZE){
++    *blockno = balloc(ROOTDEV);
++    if(*blockno == 0)
++      panic("swapout");
++    bp = bread(ROOTDEV, *blockno);
++    memmove(bp->data, src_pa, BSIZE);
++    log_write(bp);
++    brelse(bp);
++  }
++  end_op();
++}
++
++// Swap in a page into dst_pa from disk using src_sp.
++// src_sp should normally be updated with metadata
++// for retriving the page by a call to swapout().
++void
++swapin(char *dst_pa, struct swap *src_sp)
++{
++  uint *blockno;
++  struct buf *bp;
++  
++  if(!dst_pa)
++    panic("swapin");
++  for(blockno = src_sp->blocknos; blockno < &src_sp->blocknos[NBLOCKPERPAGE]; blockno++, dst_pa += BSIZE){
++    bp = bread(ROOTDEV, *blockno);
++    memmove(dst_pa, bp->data, BSIZE);
++    brelse(bp);
++  }
++}
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..6a71b9e 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_sysinfo(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +127,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_sysinfo] sys_sysinfo,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..9db11e4 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_sysinfo 22
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 1de184e..ab0912b 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -89,3 +89,12 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++
++uint64
++sys_sysinfo(void) 
++{
++  printf("live pages: %d\n", getsize());
++  //printlivepagequeue();
++	return 0;
++} 
+\ No newline at end of file
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 512c850..1db8f4b 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -67,6 +67,14 @@ usertrap(void)
+     syscall();
+   } else if((which_dev = devintr()) != 0){
+     // ok
++  } else if(r_scause() == 15 || r_scause() == 7 || r_scause() == 13){
++    if(handleswapin(PGROUNDDOWN(r_stval()))){
++      enqueue(myproc()->pid, PGROUNDDOWN(r_stval()));
++      // ok
++    }
++    else {
++      setkilled(p);
++    }
+   } else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 9f69783..701585c 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -5,6 +5,9 @@
+ #include "riscv.h"
+ #include "defs.h"
+ #include "fs.h"
++#include "livepage.h"
++#include "spinlock.h"
++#include "proc.h"
+ 
+ /*
+  * the kernel's page table.
+@@ -15,6 +18,57 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
+ 
+ extern char trampoline[]; // trampoline.S
+ 
++char *handleswapout(){
++  struct livepage *p;
++  pagetable_t pagetable;
++  pte_t *pte;
++  struct swap *s;
++  if((p = gethead()) && (pagetable = getpagetable(p->pid)) && (pte = walk(pagetable, p->va, 0)) && (s = swapalloc())){
++    char *pa = (char *)PTE2PA(*pte);
++    swapout(s, pa);
++    *pte = PTE_MARK_SWAPPED(*pte);
++    *pte = SAVE_SWAPADDR(*pte, (uint64)s);
++    //printf("swapout: pid: %d, va: %p, pa: %p\n", p->pid, p->va, pa);
++    dequeue();
++    return pa;
++  }
++  else {
++    return 0;
++  }
++}
++
++int handleswapin(uint64 va){
++  pte_t *pte;
++  struct swap *s;
++  char *pa = 0;
++  if((pte = walk(myproc()->pagetable, va, 0)) && PTE_IS_SWAPPED(*pte) && (s = (struct swap *)PTE2SWAPADDR(*pte))){
++    if(getsize() == MAXPHYPAGES){
++      pa = handleswapout();
++    }
++    else{
++      pa = (char *)kalloc();
++    }
++    //pa = handleswapout();
++    if(pa){
++      swapin(pa, s);
++      uint64 flags = PTE_FLAGS(*pte);
++      flags = flags | PTE_V;
++      flags = flags & ~PTE_P;
++      *pte = PA2PTE(pa) | flags;
++      swapfree(s);
++      //printf("swapin: pid: %d, va: %p, pa: %p\n", myproc()->pid, va, pa);
++      //printlivepagequeue();
++      return 1;
++    }
++    else{
++      return 0;
++    }
++  }
++  else {
++    return 0;
++  }
++}
++
+ // Make a direct-map page table for the kernel.
+ pagetable_t
+ kvmmake(void)
+@@ -53,6 +107,7 @@ kvmmake(void)
+ void
+ kvminit(void)
+ {
++  initlivepagequeue();
+   kernel_pagetable = kvmmake();
+ }
+ 
+@@ -117,8 +172,16 @@ walkaddr(pagetable_t pagetable, uint64 va)
+   pte = walk(pagetable, va, 0);
+   if(pte == 0)
+     return 0;
+-  if((*pte & PTE_V) == 0)
+-    return 0;
++  if((*pte & PTE_V) == 0){
++    if((*pte & PTE_P) == 0){
++      return 0;
++    }
++    else {
++      if(!handleswapin(va)){
++        return 0;
++      }
++    }
++  }
+   if((*pte & PTE_U) == 0)
+     return 0;
+   pa = PTE2PA(*pte);
+@@ -168,7 +231,7 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+ // page-aligned. The mappings must exist.
+ // Optionally free the physical memory.
+ void
+-uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
++uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free, int pid)
+ {
+   uint64 a;
+   pte_t *pte;
+@@ -179,8 +242,21 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+     if((pte = walk(pagetable, a, 0)) == 0)
+       panic("uvmunmap: walk");
+-    if((*pte & PTE_V) == 0)
+-      panic("uvmunmap: not mapped");
++    //printf("uvmunmap pid: %d, va: %p\n", pid, a);
++    if((*pte & PTE_V) == 0){
++      if(*pte & PTE_P){
++        struct swap *s;
++        if(!(s = (struct swap *)PTE2SWAPADDR(*pte))){
++          panic("uvmunmap");
++        }
++        swapfree(s);
++        //printf("uvmunmap pid: %d, va: %p\n", pid, a);
++        *pte = 0;
++        continue;
++      }
++      else 
++        panic("uvmunmap: not mapped");
++    }
+     if(PTE_FLAGS(*pte) == PTE_V)
+       panic("uvmunmap: not a leaf");
+     if(do_free){
+@@ -188,6 +264,8 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+       kfree((void*)pa);
+     }
+     *pte = 0;
++    remove(pid, a);
++    //printf("uvmunmap pid: %d, va: %p\n", pid, a);
+   }
+ }
+ 
+@@ -223,7 +301,7 @@ uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
+ // Allocate PTEs and physical memory to grow process from oldsz to
+ // newsz, which need not be page aligned.  Returns new size or 0 on error.
+ uint64
+-uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
++uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm, int pid)
+ {
+   char *mem;
+   uint64 a;
+@@ -233,17 +311,27 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+ 
+   oldsz = PGROUNDUP(oldsz);
+   for(a = oldsz; a < newsz; a += PGSIZE){
+-    mem = kalloc();
++    if(getsize() == MAXPHYPAGES){
++      mem = handleswapout();
++    }
++    else {
++      mem = kalloc();
++    }
+     if(mem == 0){
+-      uvmdealloc(pagetable, a, oldsz);
++      uvmdealloc(pagetable, a, oldsz, pid);
+       return 0;
+     }
+     memset(mem, 0, PGSIZE);
+     if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
+       kfree(mem);
+-      uvmdealloc(pagetable, a, oldsz);
++      uvmdealloc(pagetable, a, oldsz, pid);
+       return 0;
+     }
++    if(pid) {
++      enqueue(myproc()->pid, a);
++      //printf("uvmalloc pid: %d, va: %p\n", myproc()->pid, a);
++    }
++    //printf("uvmalloc pid: %d, va: %p\n", myproc()->pid, a);
+   }
+   return newsz;
+ }
+@@ -253,14 +341,14 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+ // need to be less than oldsz.  oldsz can be larger than the actual
+ // process size.  Returns the new process size.
+ uint64
+-uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
++uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int pid)
+ {
+   if(newsz >= oldsz)
+     return oldsz;
+ 
+   if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
+     int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
+-    uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
++    uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1, pid);
+   }
+ 
+   return newsz;
+@@ -289,10 +377,10 @@ freewalk(pagetable_t pagetable)
+ // Free user memory pages,
+ // then free page-table pages.
+ void
+-uvmfree(pagetable_t pagetable, uint64 sz)
++uvmfree(pagetable_t pagetable, uint64 sz, int pid)
+ {
+   if(sz > 0)
+-    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
++    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1, pid);
+   freewalk(pagetable);
+ }
+ 
+@@ -303,7 +391,7 @@ uvmfree(pagetable_t pagetable, uint64 sz)
+ // returns 0 on success, -1 on failure.
+ // frees any allocated pages on failure.
+ int
+-uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
++uvmcopy(pagetable_t old, pagetable_t new, uint64 sz, uint64 orig_sz, int npid, int ppid)
+ {
+   pte_t *pte;
+   uint64 pa, i;
+@@ -313,22 +401,38 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   for(i = 0; i < sz; i += PGSIZE){
+     if((pte = walk(old, i, 0)) == 0)
+       panic("uvmcopy: pte should exist");
+-    if((*pte & PTE_V) == 0)
+-      panic("uvmcopy: page not present");
++    if((*pte & PTE_V) == 0){
++      if((*pte & PTE_P) == 0) {
++        panic("uvmcopy: page not present");
++      }
++      else{
++        handleswapin(i);
++        enqueue(ppid, i);
++      }
++    }
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
++    if(i > orig_sz && getsize() == MAXPHYPAGES){
++      mem = handleswapout();
++    }
++    else {
++      mem = kalloc();
++    }
++    if(mem == 0)
+       goto err;
+     memmove(mem, (char*)pa, PGSIZE);
+     if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+       kfree(mem);
+       goto err;
+     }
++    if(i > orig_sz) {
++      enqueue(npid, i);
++    }
+   }
+   return 0;
+ 
+  err:
+-  uvmunmap(new, 0, i / PGSIZE, 1);
++  uvmunmap(new, 0, i / PGSIZE, 1, npid);
+   return -1;
+ }
+ 
+diff --git a/user/sysinfotest.c b/user/sysinfotest.c
+new file mode 100644
+index 0000000..c6b59fb
+--- /dev/null
++++ b/user/sysinfotest.c
+@@ -0,0 +1,63 @@
++#include "kernel/types.h"
++#include "kernel/riscv.h"
++#include "user/user.h"
++
++
++void
++sinfo() {
++  if (sysinfo() < 0) {
++    printf("FAIL: sysinfo failed");
++    exit(1);
++  }
++}
++
++
++void
++testmem() {
++  sinfo();
++
++  uint64 a = (uint64)sbrk(PGSIZE * 11);
++
++  sinfo();
++
++  if(a == 0xffffffffffffffff){
++    printf("sbrk failed");
++    exit(1);
++  }
++
++  int pid = fork();
++
++  if(pid == 0){
++    printf("Child process\n");
++    sinfo();
++    exit(0);
++  }
++
++  wait(0);
++
++
++  printf("%p\n", a);
++
++  int *b = (int *)a;
++  *b = 10;
++
++  printf("%d\n", *b);
++
++  sinfo();
++
++  
++  if((uint64)sbrk(-PGSIZE * 11) == 0xffffffffffffffff){
++    printf("sbrk failed");
++    exit(1);
++  }
++
++  sinfo();
++}
++
++
++int
++main(int argc, char *argv[])
++{
++  testmem();
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..a800dfe 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,7 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int sysinfo(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..4f1f768 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("sysinfo");
